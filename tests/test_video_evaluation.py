@@ -92,6 +92,57 @@ class VideoEvaluationSchemaTests(unittest.TestCase):
             with self.subTest(score=score), self.assertRaises(VideoEvaluationError):
                 self.parse(payload(score=score))
 
+    def test_long_free_text_is_clipped_instead_of_dropping_the_whole_evaluation(self):
+        """模型写超上限时按字段截断，保住评分、互动和偏好信号。
+
+        真实故障：score_reason 稳定写到 120 字以上，旧实现抛
+        score_reason_too_long，整次评价连同点赞、私信、偏好信号一起丢弃，
+        日志里只有一个 WARN，从外面看不出 bot 其实什么都没做。
+        """
+        result = self.parse(payload(
+            score_reason="很" * 300,
+            review="感" * 400,
+            comment="笑" * 200,
+            partition="分区" * 40,
+            preference_signals=[{
+                "type": "up", "value": "字" * 120, "polarity": "like",
+                "strength": 0.8, "evidence": "据" * 300,
+            }],
+            search_keywords=["搜" * 100],
+        ))
+        self.assertEqual(result["score"], 8.6)
+        self.assertEqual(len(result["score_reason"]), 120)
+        self.assertEqual(len(result["review"]), 180)
+        self.assertEqual(len(result["comment"]), 80)
+        self.assertEqual(len(result["partition"]), 30)
+        self.assertEqual(len(result["preference_signals"][0]["value"]), 50)
+        self.assertEqual(len(result["preference_signals"][0]["evidence"]), 100)
+        self.assertEqual(len(result["search_keywords"][0]), 40)
+
+        shared = self.parse(payload(
+            recommend_owner=True, recommend_reason="点" * 200,
+            want_dynamic=True, dynamic_angle="角" * 200,
+        ))
+        self.assertEqual(len(shared["recommend_reason"]), 80)
+        self.assertEqual(len(shared["dynamic_angle"]), 80)
+
+    def test_clipping_keeps_structured_validation_strict(self):
+        """能裁剪的只有长度：类型错、空值仍然整条作废，不能被截断掩盖。"""
+        for bad in (
+            payload(score_reason=123),
+            payload(score_reason="   "),
+            payload(review=[]),
+            payload(comment=None),
+            payload(search_keywords=[123]),
+        ):
+            with self.subTest(bad=bad), self.assertRaises(VideoEvaluationError):
+                self.parse(bad)
+
+    def test_enum_fields_stay_length_strict(self):
+        """mood 是固定枚举，写超了不能靠截断蒙混过关。"""
+        with self.assertRaises(VideoEvaluationError):
+            self.parse(payload(mood="开心" * 10))
+
 
 if __name__ == "__main__":
     unittest.main()

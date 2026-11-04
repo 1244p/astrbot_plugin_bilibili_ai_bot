@@ -37,6 +37,23 @@ def _text(value: Any, field: str, limit: int, *, empty=True) -> str:
     return value
 
 
+def _clip(value: Any, field: str, limit: int, *, empty=True) -> str:
+    """自由文本字段的宽容校验：超长按上限截断，而不是把整条评价作废。
+
+    长度限制的本意是防止模型跑偏写长篇，但提示词里不写上限时，
+    模型按自己的节奏把理由写完整就会超，一次超长会连累评分、互动、
+    偏好信号和记忆全部丢弃。结构性错误仍然抛错，只有长度这种能裁剪的
+    问题才收敛到上限，并保留“确实写超了”这一事实。
+    """
+    if not isinstance(value, str):
+        raise VideoEvaluationError(f"{field}_must_be_string")
+    value = value.strip()
+    if not empty and not value:
+        raise VideoEvaluationError(f"{field}_empty")
+    if len(value) > limit:
+        value = value[:limit].rstrip()
+    return value
+
 def parse_video_evaluation(raw: str) -> dict[str, Any]:
     text = str(raw or "").strip()
     if text.startswith("```json") and text.endswith("```"):
@@ -58,18 +75,18 @@ def parse_video_evaluation(raw: str) -> dict[str, Any]:
     score = round(float(score), 1)
     if not math.isfinite(score) or not 1.0 <= score <= 10.0:
         raise VideoEvaluationError("score_out_of_range")
-    score_reason = _text(value.get("score_reason"), "score_reason", 120, empty=False)
-    comment = _text(value.get("comment"), "comment", 80)
+    score_reason = _clip(value.get("score_reason"), "score_reason", 120, empty=False)
+    comment = _clip(value.get("comment"), "comment", 80)
     mood = _text(value.get("mood"), "mood", 10, empty=False)
     if mood not in MOODS:
         raise VideoEvaluationError("invalid_mood")
-    review = _text(value.get("review"), "review", 180, empty=False)
-    partition = _text(value.get("partition"), "partition", 30)
+    review = _clip(value.get("review"), "review", 180, empty=False)
+    partition = _clip(value.get("partition"), "partition", 30)
     want_follow = value.get("want_follow")
     recommend_owner = value.get("recommend_owner")
     if not isinstance(want_follow, bool) or not isinstance(recommend_owner, bool):
         raise VideoEvaluationError("boolean_field_invalid")
-    recommend_reason = _text(
+    recommend_reason = _clip(
         value.get("recommend_reason"), "recommend_reason", 80
     )
     if recommend_owner and not recommend_reason:
@@ -79,7 +96,7 @@ def parse_video_evaluation(raw: str) -> dict[str, Any]:
     want_dynamic = value.get("want_dynamic", False)
     if not isinstance(want_dynamic, bool):
         raise VideoEvaluationError("boolean_field_invalid")
-    dynamic_angle = _text(value.get("dynamic_angle", ""), "dynamic_angle", 80)
+    dynamic_angle = _clip(value.get("dynamic_angle", ""), "dynamic_angle", 80)
     if want_dynamic and not dynamic_angle:
         raise VideoEvaluationError("dynamic_wish_needs_angle")
     if not want_dynamic and dynamic_angle:
@@ -99,14 +116,14 @@ def parse_video_evaluation(raw: str) -> dict[str, Any]:
             raise VideoEvaluationError("invalid_preference_type")
         if polarity not in PREFERENCE_POLARITIES:
             raise VideoEvaluationError("invalid_preference_polarity")
-        signal_value = _text(item.get("value"), "preference_value", 50, empty=False)
+        signal_value = _clip(item.get("value"), "preference_value", 50, empty=False)
         strength = item.get("strength")
         if isinstance(strength, bool) or not isinstance(strength, (int, float)):
             raise VideoEvaluationError("preference_strength_must_be_number")
         strength = round(float(strength), 2)
         if not 0.0 <= strength <= 1.0:
             raise VideoEvaluationError("preference_strength_out_of_range")
-        evidence = _text(item.get("evidence"), "preference_evidence", 100, empty=False)
+        evidence = _clip(item.get("evidence"), "preference_evidence", 100, empty=False)
         dedupe_key = (signal_type, signal_value.casefold(), polarity)
         if dedupe_key in seen_signals:
             continue
@@ -121,7 +138,7 @@ def parse_video_evaluation(raw: str) -> dict[str, Any]:
         raise VideoEvaluationError("search_keywords_schema_mismatch")
     keywords = []
     for item in raw_keywords:
-        keyword = _text(item, "search_keyword", 40, empty=False)
+        keyword = _clip(item, "search_keyword", 40, empty=False)
         if keyword not in keywords:
             keywords.append(keyword)
 
@@ -139,4 +156,5 @@ VIDEO_EVALUATION_SCHEMA_PROMPT = """只输出一个完整JSON对象，不要Mark
 {"score":7.0,"score_reason":"评分理由","comment":"评论区短句或空字符串","mood":"开心|平静|无聊|感动|好笑|震撼|困惑","review":"个人感想","want_follow":false,"recommend_owner":false,"recommend_reason":"","want_dynamic":false,"dynamic_angle":"","partition":"实际分区","preference_signals":[{"type":"up|partition|work|character|food|theme|music|game|technology|activity|location|other","value":"具体对象","polarity":"like|dislike|fatigue|curious","strength":0.0,"evidence":"本视频中的具体依据"}],"search_keywords":["以后真能拿去B站搜索的具体词"]}
 score是自己的观感；recommend_owner表示自己是否真想分享这次发现，不要求与主人的爱好相同。推荐理由写具体看点，不把自己的喜欢说成对方的喜欢。
 want_dynamic表示看完是否真有话想在自己的B站动态里说（点评、吐槽、安利或由它引出的联想），大多数视频填false；为true时dynamic_angle写想说的具体角度，否则留空。
-最多5个喜好信号和5个搜索词，宁缺毋滥。不要只写“动漫”“游戏”这种过宽词；优先作品、人物、作者、菜名、歌手、技术、活动或具体主题。一次高分只代表本次信号，不要声称已形成永久喜好。喜好信号只记录本次具体感受，不照抄人设或把主人的爱好写成自己的。"""
+最多5个喜好信号和5个搜索词，宁缺毋滥。不要只写“动漫”“游戏”这种过宽词；优先作品、人物、作者、菜名、歌手、技术、活动或具体主题。一次高分只代表本次信号，不要声称已形成永久喜好。喜好信号只记录本次具体感受，不照抄人设或把主人的爱好写成自己的。
+字数上限（超出部分会被截断，等于白写）：score_reason≤120字，review≤180字，comment≤80字，dynamic_angle≤80字，recommend_reason≤80字，partition≤30字，每个preference_signals.value≤50字、evidence≤100字，每个search_keyword≤40字。"""
