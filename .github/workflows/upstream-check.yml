@@ -106,6 +106,8 @@ jobs:
       - name: 计算版本号并打 tag
         id: tag
         if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           UPVER=$(grep -E '^version:' metadata.yaml | head -1 | awk '{print $2}' | tr -d '"'"'"' ')
@@ -113,15 +115,33 @@ jobs:
             echo "::error::读不到 metadata.yaml 里的 version"
             exit 1
           fi
+
           MAXR=$(git tag -l "v${UPVER}-r*" | grep -oE 'r[0-9]+$' | tr -d 'r' | sort -n | tail -1 || true)
-          N=$(( ${MAXR:-0} + 1 ))
-          TAG="v${UPVER}-r${N}"
-          git tag "$TAG"
+          TAG=""
+          if [ -n "$MAXR" ]; then
+            CAND="v${UPVER}-r${MAXR}"
+            # tag 存在但 release 不在，说明上一轮失败在发版这一步，复用而不是再往后 +1
+            # 不复用的话，每次失败都会白白吃掉一个版本号
+            if ! gh release view "$CAND" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              TAG="$CAND"
+              echo "复用已存在的 tag \`${TAG}\`（上一轮没发出 release）" >> "$GITHUB_STEP_SUMMARY"
+            else
+              TAG="v${UPVER}-r$(( MAXR + 1 ))"
+            fi
+          else
+            TAG="v${UPVER}-r1"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "tag ${TAG} 已在本地"
+          else
+            git tag "$TAG"
+          fi
           git push origin "HEAD:main"
           git push origin "$TAG"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "upver=${UPVER}" >> "$GITHUB_OUTPUT"
-          echo "版本号：\`${TAG}\`（基于上游 ${UPVER} 的第 ${N} 次修订）" >> "$GITHUB_STEP_SUMMARY"
+          echo "版本号：\`${TAG}\`（基于上游 ${UPVER}）" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 打包插件 zip
         id: pack
@@ -194,7 +214,10 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.tag.outputs.tag }}"
+          # 必须显式 --repo：这台 runner 上加了 upstream remote，
+          # gh 会把它当成仓库来源，跑到上游去建 release
           gh release create "$TAG" "${{ steps.pack.outputs.zip }}" \
+            --repo "${{ github.repository }}" \
             --title "$TAG" \
             --notes-file /tmp/notes.md
           echo "已发布 https://github.com/${{ github.repository }}/releases/tag/${TAG}" >> "$GITHUB_STEP_SUMMARY"
@@ -239,5 +262,5 @@ jobs:
             gh issue comment "$EXISTING" --body-file /tmp/conflict.md
             echo "已补充到 issue #${EXISTING}" >> "$GITHUB_STEP_SUMMARY"
           else
-            gh issue create --title "自动 rebase 冲突：上游 ${SHORT}" --body-file /tmp/conflict.md
+            gh issue create --repo "$REPO" --title "自动 rebase 冲突：上游 ${SHORT}" --body-file /tmp/conflict.md
           fi
