@@ -1,113 +1,243 @@
-name: 上游更新检查
+name: 上游同步与发版
 
-# 为什么放在 GitHub 上而不是本机：fork 的意义是不用盯着原仓库，
-# 上游一动就能收到通知。这个 workflow 只负责"发现并报告"，
-# 不改代码——本地补丁改的正是评价校验，上游一旦自己动了那块，
-# 自动合并会盖掉判断，得人看一眼再决定。
+# 这个 workflow 干三件事，按顺序：
+#   1. 看上游有没有新提交（上游不会通知 fork，只能轮询）
+#   2. 有就自动 rebase，冲突则中止并开 issue —— 绝不带着半成品往下走
+#   3. rebase 成功就打 tag、打包插件 zip、发 release
+#
+# 为什么打包 zip 而不是只留源码：AstrBot 后台是上传 zip 装插件的，
+# 每次升级都要人手动 clone、删 tests、压缩，这一步没必要留着。
+#
+# 为什么冲突时整个 job 失败而不继续发版：带着冲突强行发版，
+# 发出去的就是个装不上的包，比没有包更糟。
 
 on:
   schedule:
     # 每周一 02:00 UTC = 北京时间 10:00
     - cron: "0 2 * * 1"
   workflow_dispatch:
-  # 上游有新 push 时 GitHub 不会通知 fork，只能靠定时轮询；
-  # push 触发留给自己改完代码顺手验证一次。
+    inputs:
+      force_release:
+        description: "跳过上游检测，直接给当前 HEAD 打 tag 并发 release"
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 env:
   UPSTREAM_REPO: chenluQwQ/astrbot_plugin_bilibili_ai_bot
   UPSTREAM_BRANCH: main
-  # 这三个文件是本地补丁的落脚点，上游一动就得人工判断补丁还成不成立
+  PLUGIN_NAME: astrbot_plugin_bilibili_ai_bot
+  # 这三个文件是本地补丁的落脚点，上游一动就是 rebase 冲突的高危区
   WATCH_FILES: "core/video_evaluation.py core/proactive.py tests/test_video_evaluation.py"
 
 jobs:
-  check:
+  sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 拉取上游并比较
-        id: cmp
+      - name: 配置 git 身份
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 拉取上游并尝试 rebase
+        id: sync
         run: |
           set -euo pipefail
+          FORCE="${{ inputs.force_release }}"
+          OLD=$(git rev-parse HEAD)
+          echo "old=${OLD}" >> "$GITHUB_OUTPUT"
+
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
           git fetch --quiet upstream "${UPSTREAM_BRANCH}"
+          UPSTREAM_HEAD=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          echo "upstream_head=${UPSTREAM_HEAD}" >> "$GITHUB_OUTPUT"
 
-          BASE=$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")
-          NEW=$(git log --pretty=format:'- `%h` %s' "HEAD..upstream/${UPSTREAM_BRANCH}" || true)
-
-          if [ -z "$NEW" ]; then
-            echo "has_new=false" >> "$GITHUB_OUTPUT"
-            echo "上游无新提交（upstream/${UPSTREAM_BRANCH} = ${BASE}）" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$FORCE" != "true" ] && git merge-base --is-ancestor "$UPSTREAM_HEAD" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游无新提交（upstream/${UPSTREAM_BRANCH} = ${UPSTREAM_HEAD:0:7}），本轮不动" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          {
-            echo "### 上游有新提交：upstream/${UPSTREAM_BRANCH} 现在在 \`${BASE}\`"
-            echo ""
-            echo "$NEW"
-            echo ""
-            echo "### 这些提交改了什么"
-            echo ""
-            echo '```'
-            git diff --stat "HEAD...upstream/${UPSTREAM_BRANCH}"
-            echo '```'
-            echo ""
-            echo "### 与本地补丁的关系"
-            echo ""
-          } > /tmp/report.md
-
-          TOUCHED=0
-          for f in $WATCH_FILES; do
-            if ! git diff --quiet "HEAD...upstream/${UPSTREAM_BRANCH}" -- "$f"; then
-              echo "- ⚠️ 上游改过 \`${f}\`，先看 diff 再决定本地补丁是否还成立" >> /tmp/report.md
-              TOUCHED=1
-            fi
-          done
-
-          if [ "$TOUCHED" = "0" ]; then
-            echo "- ✅ 评价相关文件没被上游动过，可以直接 \`git rebase upstream/main\`" >> /tmp/report.md
-          else
-            echo "" >> /tmp/report.md
-            echo "特别检查：\`core/video_evaluation.py\` 里 \`score_reason\` 是否还是 \`_text(..., 120, ...)\` 硬抛错，" >> /tmp/report.md
-            echo "以及有没有为新字段再漏写提示词字数——那是同一个毛病换了个字段。" >> /tmp/report.md
+          if [ "$FORCE" = "true" ]; then
+            echo "手动发版：跳过 rebase，直接对当前 HEAD 发 release" >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          echo "" >> /tmp/report.md
-          echo "后续步骤：" >> /tmp/report.md
-          echo '```bash' >> /tmp/report.md
-          echo "git rebase upstream/main && python -m pytest tests/ -q" >> /tmp/report.md
-          echo '```' >> /tmp/report.md
+          # 先记录上游改了哪些敏感文件，冲突时这就是排查线索
+          TOUCHED=""
+          for f in $WATCH_FILES; do
+            if ! git diff --quiet "HEAD...${UPSTREAM_HEAD}" -- "$f"; then
+              TOUCHED="${TOUCHED}- \`${f}\`\n"
+            fi
+          done
+          # 多行值必须用 <<DELIM 语法，直接 name=value 会把换行写坏
+          {
+            echo "touched<<__TOUCHED__"
+            printf "%b" "$TOUCHED"
+            echo "__TOUCHED__"
+          } >> "$GITHUB_OUTPUT"
 
-          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
-          echo "has_new=true" >> "$GITHUB_OUTPUT"
-          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
-          echo "上游有新提交，已写入报告"
+          if ! git rebase "$UPSTREAM_HEAD"; then
+            git rebase --abort || true
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::rebase 冲突，已中止，未发版"
+            exit 1
+          fi
 
-      - name: 开 issue 或补充到已有 issue
-        if: steps.cmp.outputs.has_new == 'true'
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "### rebase 成功"
+            echo ""
+            echo "上游新的提交："
+            echo ""
+            git log --pretty=format:'- `%h` %s' "${OLD}..${UPSTREAM_HEAD}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 计算版本号并打 tag
+        id: tag
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          UPVER=$(grep -E '^version:' metadata.yaml | head -1 | awk '{print $2}' | tr -d '"'"'"' ')
+          if [ -z "$UPVER" ]; then
+            echo "::error::读不到 metadata.yaml 里的 version"
+            exit 1
+          fi
+          MAXR=$(git tag -l "v${UPVER}-r*" | grep -oE 'r[0-9]+$' | tr -d 'r' | sort -n | tail -1 || true)
+          N=$(( ${MAXR:-0} + 1 ))
+          TAG="v${UPVER}-r${N}"
+          git tag "$TAG"
+          git push origin "HEAD:main"
+          git push origin "$TAG"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "upver=${UPVER}" >> "$GITHUB_OUTPUT"
+          echo "版本号：\`${TAG}\`（基于上游 ${UPVER} 的第 ${N} 次修订）" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 打包插件 zip
+        id: pack
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          DEST="/tmp/pkg/${PLUGIN_NAME}"
+          mkdir -p "$DEST"
+          git archive HEAD | tar -x -C "$DEST"
+          # AstrBot 装插件只认插件本体，测试和 CI 配置塞进去只会让包变大
+          rm -rf "$DEST/tests" "$DEST/.github"
+          find "$DEST" -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find "$DEST" -type f -name '*.pyc' -delete
+          (
+            cd /tmp/pkg
+            zip -qr "${GITHUB_WORKSPACE}/${PLUGIN_NAME}-${TAG}.zip" "${PLUGIN_NAME}"
+          )
+          echo "zip=${PLUGIN_NAME}-${TAG}.zip" >> "$GITHUB_OUTPUT"
+          {
+            echo ""
+            echo "### 插件包"
+            echo ""
+            echo '```'
+            unzip -l "${PLUGIN_NAME}-${TAG}.zip" | tail -5
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 生成 release 说明
+        id: notes
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          UPVER="${{ steps.tag.outputs.upver }}"
+          OLD="${{ steps.sync.outputs.old }}"
+          {
+            echo "基于上游 [\`${UPSTREAM_REPO}\`](https://github.com/${UPSTREAM_REPO}) 的 \`${UPVER}\`，"
+            echo "加上本 fork 对视频评价长度校验的修补。"
+            echo ""
+            if [ -n "$(git log --pretty=format:'%h' "${OLD}..HEAD" 2>/dev/null | head -1)" ]; then
+              echo "### 本次同步进来的上游提交"
+              echo ""
+              git log --pretty=format:'- `%h` %s' "${OLD}..${{ steps.sync.outputs.upstream_head }}" || true
+              echo ""
+            fi
+            echo "### 本 fork 相对上游的改动"
+            echo ""
+            echo '```'
+            git diff --stat "${{ steps.sync.outputs.upstream_head }}...HEAD" 2>/dev/null || echo "（无差异）"
+            echo '```'
+            echo ""
+            echo "### 安装"
+            echo ""
+            echo "下载下方 \`${PLUGIN_NAME}-${{ steps.tag.outputs.tag }}.zip\`，"
+            echo "到 AstrBot 后台 → 插件管理 → 安装插件 → 上传 zip，覆盖同名插件即可。"
+            echo "配置和数据都在 \`data/config/\` 与 \`data/plugin_data/\`，不受插件升级影响。"
+            echo ""
+            echo "### 如果上游动过这些文件"
+            echo ""
+            echo "\`core/video_evaluation.py\`、\`core/proactive.py\`、\`tests/test_video_evaluation.py\`。"
+            echo "自动 rebase 成功不代表补丁还有意义——上游可能自己改了长度校验，"
+            echo "发版前建议确认 \`score_reason\` 是否仍是 \`_text(..., 120, ...)\` 硬抛错。"
+          } > /tmp/notes.md
+          cat /tmp/notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 发 release
+        if: steps.sync.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          EXISTING=$(gh issue list --state open --search '上游更新 in:title' \
-            --json number --jq '.[0].number // empty')
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release create "$TAG" "${{ steps.pack.outputs.zip }}" \
+            --title "$TAG" \
+            --notes-file /tmp/notes.md
+          echo "已发布 https://github.com/${{ github.repository }}/releases/tag/${TAG}" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: 冲突时开 issue
+        if: failure() && steps.sync.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOUCHED: ${{ steps.sync.outputs.touched }}
+        run: |
+          set -euo pipefail
+          UPHEAD="${{ steps.sync.outputs.upstream_head }}"
+          SHORT="${UPHEAD:0:7}"
+          {
+            echo "自动 rebase 到上游 \`${SHORT}\` 时冲突，已中止，**没有发版**。"
+            echo ""
+            echo "上游动过的敏感文件："
+            echo ""
+            printf "%b" "$TOUCHED"
+            echo ""
+            echo "### 手动处理"
+            echo ""
+            echo '```bash'
+            echo "cd E:/DSH/Astrbot/bili_ai_bot"
+            echo "git fetch upstream main && git rebase upstream/main"
+            echo "# 解决冲突后"
+            echo "python -m pytest tests/ -q    # 必须 456 passed 左右，不能少"
+            echo "git push fork main"
+            echo '```'
+            echo ""
+            echo "推完到 Actions 页手动跑一次本 workflow，勾上 \`force_release\` 发版。"
+            echo ""
+            echo "### 重点看什么"
+            echo ""
+            echo "\`core/video_evaluation.py\` 里 \`score_reason\` 还是不是 \`_text(..., 120, ...)\` 硬抛错。"
+            echo "如果上游自己改成了截断或者放宽了阈值，本地补丁就该删掉，别再叠一层。"
+          } > /tmp/conflict.md
+
+          EXISTING=$(gh issue list --state open --search '自动 rebase 冲突 in:title' \
+            --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
-            {
-              echo "又发现一批新提交（upstream/main = \`${{ steps.cmp.outputs.base }}\`）："
-              echo ""
-              cat /tmp/report.md
-            } > /tmp/comment.md
-            gh issue comment "$EXISTING" --body-file /tmp/comment.md
-            echo "已补充到 issue #${EXISTING}"
+            gh issue comment "$EXISTING" --body-file /tmp/conflict.md
+            echo "已补充到 issue #${EXISTING}" >> "$GITHUB_STEP_SUMMARY"
           else
-            gh issue create \
-              --title "上游更新：${{ steps.cmp.outputs.base }}" \
-              --body-file /tmp/report.md
+            gh issue create --title "自动 rebase 冲突：上游 ${SHORT}" --body-file /tmp/conflict.md
           fi
